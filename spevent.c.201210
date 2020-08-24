@@ -1,0 +1,535 @@
+/* Copyright (c) READ Well Services, 2010.*/
+/* All rights reserved.                       */
+
+/* SPEVENT: $Revision: 1.0 $ ; $Date: 2011/09/17 22:58:42 $	*/
+
+#include "su.h"
+#include "segy.h"
+#include <segyhdr.h>
+#include <cwp.h>
+#include "header.h"
+#include <signal.h>
+
+/*********************** self documentation **********************/
+char *sdoc[] = {
+"                                                                               ",
+" SPEVENT - multi-level micro-seismic event detection                           ",
+"                                                                               ",
+" spevent <stdin >stdout [optional parameters]                                  ",
+"                                                                               ",
+" Optional parameters:                                                          ",
+"                                                                               ",
+"   key=ep          gather sorting key                                          ",
+"   nmax=12         max. number of receiver stations expected in a gather       ",
+"   nc=3            number of components expected in a gather                   ",
+"                                                                               ",
+"   level=2         =1: pre-screening of possible seismic event                 ",
+"                   =2: detect, associate and separate (multiple) seismic events",
+"                   =3: determine onset times of events (typically S-arrivals)  ",
+"                   =4: determine S onset times of events based on SV/SH components",
+"                                                                               ",
+"   drop=0          =1: drop gather where no seismic event found                ",
+"                   =2: drop receiver where no clear seismic event found        ",
+"                                                                               ",
+"   eeout=0         =1: output trace of energy envelop for QC                   ",
+"                                                                               ",
+" Threshold regarding amplitude ratio for detecting event                       ",
+"                                                                               ",
+"   thres=5         rms amplitude ratio of three detection time window          ",
+"   perc=70         percentage threshold for receivers with event detected      ",
+"                                                                               ",
+" Parameters to determine reference amplitude: 					",
+"                                                                               ",
+"   win1=40  [ms]   window length above/before for event detection              ",
+"   win2=20  [ms]   window length below/after  for event detection              ",
+"   win3=10  [ms]   window length to calculate rms amplitude                    ",
+"                                                                               ",
+" Parameters in addition for level 2 event detection: 				",
+"                                                                               ",
+"   wine=200 [ms]   trace length of isolated event                              ",
+"   wina=10  [ms]   event association/correlation window for adjacent receiver  ",
+"   ckey=counit     key holding the ordering no. of isolated events (1,2,3,...) ",
+"                                                                               ",
+" Parameters for level 3 S-arrival time estimation: 				",
+"                                                                               ",
+"   t1=T/2-30 [ms]  begin of search window for S-arrivals                       ",
+"   t2=T/2+70 [ms]  end of search window for S-arrivals                         ",
+"   tkey=laga       key holding S-arrival time in 1/10 ms                       ",
+"                                                                               ",
+"   verbose=0       >0  echo information                                        ",
+"                                                                               ",
+" Approach:                                                                     ",
+" ---------                                                                     ",
+" This program uses approach similar to first break detection (ShortTerm/LongTerm",
+" ratio, i.e. RMS[win2/win1]), however, with a short term (win3) rms as weighting",
+" factor. It uses three windows, one before/above (win1) and two after/below    ",
+" (win2 & win3). If the weghted ST/LT ratio exceeds the threshold given by      ",
+" parameter (thres=), an event is said found. However, a gather is said to      ",
+" contain seismic event if at least certain percentage (perc=) of receivers are ",
+" deteted with any event. If the parameter is set to zero (drop=0), the keyword ",
+" corr is than set to zero to signal no event detection.                        ",
+"									",
+" Notes: 								",
+" ------								",
+"                                                                       ",
+" Typical sequence for micro-seismic event detection:                   ",
+"									",
+" seg2su length=10 overlap=0.2 key=corr file=fieldrecord.sg2 |\\",
+" spsort ep corr |\\",
+" sufilter f=10,20,160,240 |\\",
+" spfxmedian key=ep twin=0.2 |\\",
+" sushw match=cdp key=hour infile=receiver-azimuth.tbl |\\",
+" sp2crot key=ep mode=0 nc=3 pol=-1,-1,1 |\\",
+" spevent key=corr level=1 drop=2 |\\",
+" spevent key=corr level=2 length=1 ckey=counit |\\",
+" spsort ep corr counit |\\",
+" spsepps |\\",
+" tee p-s.su |\\",
+" spmsmig > event-image-dist-depth.su",
+"                                                                               ",
+" Version 1.1.0  last modified Nov. 2012 by Sanyu Ye				",
+NULL
+};
+
+/* Credits:
+ *
+ * Sanyu Ye, sanyu.ye@yahoo.com
+ *
+ */
+/**************** end self doc ***********************************/
+
+// forward prototyp declaration
+float calcEE(const int nc, const int nrcv, const int ns, const float*** indata, float** eedata);
+float calcWinEE(const int nrcv, const int nc, const int nw1, const int nw2, const int nw3, const int it1, const int it2,
+    const float power, const float power3, const float** indata, float** eedata, int* itmax);
+float calcRms(const int itbeg, const int nt, const float* data);
+int  detectEvents(const int nrcv, const int ns, const float** eedata, const int nw1,
+    const int nw2, const int nw3, const float threshold, int* nv, int** ite, float** w2rms);
+
+#include "sprinthlp.c"
+#include "datetime.c"
+
+int main(int argc, char **argv) 
+{
+    cwp_String key, ckey, tkey;          // header key word from segy.h
+    cwp_String type, ctype, ttype;         // ... its type
+    int index, cindex, tindex;          // ... its index
+    Value val, valnew;                  // ... its value
+
+    int level, totalEvents, hasEvent, ne, nmax;
+
+    int i, j, k;        // trace counter
+    int nsegy;          // number of byte read
+    int ntr, total, ngather, etotal; // number of traces and gathers etc
+    int nsevent = 0;    // number of seismic events
+    int nw1, nw2, nw3, nwa, nwe;       // number of samples
+    int nrcv, ncmp;     // expected and actual number of receivers in gather
+    int drop = 0;       // flag to output drop gather/receiver without event found
+    int eeout = 0;      // flag to output trace of energy envelop
+    int eof = 0;        // END OF File flag
+    int verbose;        // flag for printing information
+
+
+    float win1, win2, win3, wina, wine;   // time windows to calculate rms or average amplitudes		*/
+    float dt;           // time sampling interval		*/
+    float thres, power, power3; // amplitude ratio	*/
+    float perc;         // percentage threshold of receivers with events detected
+    float t1, t2, tevtm;
+    float grms;
+    segy tr, outtr;
+
+    /* Initialize */
+    initargs(argc, argv);
+    requestdoc(0);
+
+    if (!getparint("verbose", &verbose)) verbose = 0;
+    if (!getparint("nmax", &nmax))      nmax = 12;
+    if (!getparint("nc", &ncmp))        ncmp = 3;
+    if (!getparint("level", &level))   level = 2;
+    if (!getparint("eeout", &eeout))   eeout = 0;
+    if (!getparint("drop", &drop))      drop = 0;
+    if (!getparfloat("power",  &power))  power  = 1.0;
+    if (!getparfloat("power3", &power3)) power3 = 1.0;
+    if (!getparfloat("thres",  &thres)) thres =  5.0;
+    if (!getparfloat("perc",  &perc))     perc =  70.0;
+    if (!getparfloat("win1", &win1)) win1 = 40;
+    if (!getparfloat("win2", &win2)) win2 = 20;
+    if (!getparfloat("win3", &win3)) win3 = 10;
+    if (!getparfloat("wina", &wina)) wina = 10;
+    if (!getparfloat("wine", &wine)) wine = 200;
+
+    if(verbose > 1) {
+        warn("level=%d  percentage=%2.0f  threshold=%3.1f   win1=%2.0f  win2=%2.0f  win3=%2.0f",
+                level, perc, thres, win1, win2, win3);
+        warn("correlation window=%2.0f  trace length=%3.0f", wina, wine);
+    }
+
+    /* Get info from first trace */
+    if ((nsegy = gettr(&tr)) < HDRBYTES) err("can't read first trace");
+    if (!tr.dt) err("dt header field must be set");
+    dt = ((double) tr.dt) / 1000000.0;
+    int ns = (int) tr.ns;
+
+    /* Get sorting/gather key  */
+    if (!getparstring("key", &key)) key = "ep";
+    type = hdtype(key);
+    index = getindex(key);
+    gethval(&tr, index, &val);
+
+    if (!getparstring("ckey", &ckey)) ckey = "counit";
+    ctype = hdtype(ckey);
+    cindex = getindex(ckey);
+    if (!getparstring("tkey", &tkey)) tkey = "laga";
+    ttype = hdtype(tkey);
+    tindex = getindex(tkey);
+
+    nw1 = NINT(0.001*win1/dt);
+    nw2 = NINT(0.001*win2/dt);
+    nw3 = NINT(0.001*win3/dt);
+    nwa = NINT(0.001*wina/dt);
+    nwe = NINT(0.001*wine/dt);
+    const int nemax = ns / (nw1 + nw2);  // max. number of event
+    if (!getparfloat("t1", &t1)) t1 = (float) ns * 1000.0 * dt * 0.6 - 40.0;
+    if (!getparfloat("t2", &t2)) t2 = (float) ns * 1000.0 * dt * 0.6 + 60.0;
+    int it1 = NINT(0.001 * t1 / dt);
+    int it2 = NINT(0.001 * t2 / dt);
+    if (it1 < nw1) it1 = nw1;
+    if (it2 >= ns - MAX(nw2, nw3)) it2 = ns -  MAX(nw2, nw3) - 1;
+    if (verbose>1) warn("time window ms/ns  %1.0f/%d ~ %1.0f/%d", t1, it1, t2, it2);
+
+    // allocate and reset memory for input and output traces
+    segyhdr**  hdrs = (segyhdr**) ealloc2(ncmp, nmax, HDRBYTES);
+    float*** indata = ealloc3float(ns, ncmp, nmax);
+    float**  eedata = ealloc2float(ns, nmax);     // trace array for energy envelop
+    float**   winee = ealloc2float(ns, nmax);     // trace array for energy envelop
+    float**   w2rms = ealloc2float(nemax, nmax);   // cache for storing rms of win2 of detected event
+    int**    ite = ealloc2int(nemax, nmax);          // event location in sample number
+    int* itmaxee = ealloc1int(nmax);                   // number of event detected on every single receiver
+    int*      nv = ealloc1int(nmax);                   // number of event detected on every single receiver
+    int*     nvn = ealloc1int(nemax);           // number of events of every seismic event
+    int* itevent = ealloc1int(nemax);
+    int*    ircv = ealloc1int(nemax*nmax);
+    int*    jevt = ealloc1int(nemax*nmax);
+    int*      ii = ealloc1int(nemax*nmax);       // serial index of event
+    int**    iii = ealloc2int(nmax, nemax);      // index of event by seismic event no and receiver no
+    float*     f = ealloc1float(nemax*nmax);   // cache for storing rms of win2 of detected event
+    float*  tevt = ealloc1float(nmax);          // cache for storing times of maximum enegy of detected event
+    /* zero out data memory */
+    memset(ii, 0, nmax * nemax * sizeof (int));
+    memset(ircv, 0, nmax * nemax * sizeof (int));
+    memset(*ite, 0, nmax * nemax * sizeof (int));
+    memset(nv, 0, nmax * sizeof (int));
+    memset(itmaxee, 0, nmax * sizeof (int));
+    memset(itevent, 0, nemax * sizeof (int));
+    memset(*hdrs, 0, nmax * ncmp * HDRBYTES);
+    memset(**indata, 0, nmax * ncmp * ns * FSIZE);
+    memset( *eedata, 0, nmax * ns * FSIZE);
+    memset(  *winee, 0, nmax * ns * FSIZE);
+    memset(  *w2rms, 0, nmax * nemax * FSIZE);
+
+    /* Read headers and data while getting a count */
+    ngather = ntr = total = etotal = 0;
+    do {
+        if (nsegy > HDRBYTES) gethval(&tr, index, &valnew);
+        else eof = 1; //END_OF_FILE
+        if (nsegy > HDRBYTES && !valcmp(type, val, valnew)) { /* same key and more data*/
+            if (ntr > ncmp*nmax - 1) err("\nNumber of traces exceeding nmax=%d\n", nmax*ncmp);
+            int ircv = ntr/ncmp;
+            int icmp = ntr%ncmp;
+            memcpy(&hdrs[ircv][icmp], &tr, HDRBYTES);
+            memcpy(indata[ircv][icmp], tr.data, FSIZE * ns);
+            ++ntr;
+            val = valnew;
+        } else { // new gather or END_OF_FILE
+            int keyno = vtoi(type, val);
+
+            nrcv = ntr/ncmp;
+
+            ++ngather;
+            if (verbose) warn("  processing %d traces %d-th gather (%s=%d)", ntr, ngather, key, keyno);
+
+            if (ntr%ncmp !=0) {
+                err(" Number of traces (%d != %d x %d) not equal number of receivers times compomnents", ntr, nrcv, ncmp);
+            }
+            
+            total += ntr;
+
+            grms = calcEE(ncmp, nrcv, ns, indata, eedata); // calulate rms (3C) amplitude for every sample and receiver
+
+            if (level < 3) {
+                totalEvents = detectEvents(nrcv, ns, eedata, nw1, nw2, nw3, thres, nv, ite, w2rms);
+                if (verbose > 0) {
+                    fprintf(stderr, " Total %d events found for %d-th gather (%s=%d) with fldr=%d\n",
+                            totalEvents, ngather, key, keyno, hdrs[0][0].fldr);
+                    if (verbose > 1) {
+                        fprintf(stderr, "RCV NE  Time/RMS  Average RMS amplitude %5.3g in this gather\n", grms);
+                        for(i=0; i<nrcv; ++i) {
+                            fprintf(stderr, "%2d  %2d", i+1, nv[i]);
+                            for(j=0; j<nv[i]; ++j) fprintf(stderr, " %5.3f/%7.3g", dt*ite[i][j], w2rms[i][j]);
+                            fprintf(stderr, "\n");
+                        }
+                    }
+                }
+            } else {  // level = 3 or 4
+                // calculate rms within win3 between t1 and t2
+                calcWinEE(nrcv, ncmp, nw1, nw2, nw3, it1, it2, power, power3, eedata, winee, itmaxee);
+                if (verbose > 1) {
+                    fprintf(stderr, "S-arrival time found:");
+                    for(i=0; i<nrcv; ++i) fprintf(stderr, "%5.3f  ", itmaxee[i]*dt);
+                    fprintf(stderr, "\n");
+                }
+                for (i=0; i<nrcv; ++i) tevt[i] = 10000.0 * dt * itmaxee[i];
+                tevtm = quick_select(tevt, nrcv);
+            }
+            hasEvent = 0;
+            if (level == 1) {
+                for (i=0, ne=0; i<nrcv; ++i) if(nv[i] > 0) ++ne;
+                if ( (float) ne / (float) nrcv > 0.01 * perc) {
+                    hasEvent = 1;
+                    ++etotal;
+                }
+            }
+            if (level == 2) {
+                // sort event by event time
+                for (i = 0, k = 0; i < nrcv; ++i) {
+                    for (j = 0; j < nv[i]; ++j) {
+                        f[k] = (float) ite[i][j];   // event time in float
+                        ircv[k] = i;                // rcv no event belongs to
+                        jevt[k] = j;                // event no on that receiver
+                        ii[k] = k;                  // ordering no
+                        ++k;
+                    }
+                }
+                qkisort(k, f, ii);
+                qksort(k, f);
+
+                // figure out association/correlation
+                nsevent = 0;
+                int nc;  // number of events correlated/belongs to previous event
+                int evtno = 0;
+                for (i = 1; i < k;) {
+                    for (j = i, nc = 0, iii[nsevent][nc++] = evtno; j < k; ++j) {
+                        i = j + 1;
+                        ++evtno;
+                        if (f[j] - f[j - 1] < nrcv*nwa) {  // belong probably to same event
+                            iii[nsevent][nc] = evtno;
+                            ++nc;
+                        }
+                        if (j == k - 1 || f[j] - f[j - 1] >= nrcv*nwa) { // last event or start of a new event
+                            if (100.0 * nc / nrcv > perc) { // an event found
+                                // print out info of seismic event
+                                if (verbose > 1) {
+                                    fprintf(stderr, "\nSeismic Event No. %d by corellating %d small events (Time/EvtNo/RcvNo/EvtNoWithinReceiver)\n",
+                                            nsevent + 1, nc);
+                                    int ie;
+                                    for (ie = 0; ie < nc; ++ie) {
+                                        fprintf(stderr, "%5.3f/%d/%d/%d ",(float) ite[ircv[ii[iii[nsevent][ie]]]][jevt[ii[iii[nsevent][ie]]]]*dt,
+                                          ii[iii[nsevent][ie]], ircv[ii[iii[nsevent][ie]]] + 1, jevt[ii[iii[nsevent][ie]]] + 1);
+                                    }
+                                    fprintf(stderr, "\n");
+                                }
+                                
+                                nvn[nsevent] = nc;
+                                itevent[nsevent++] = (int) f[j - nc/2];  // median event time
+                            }
+                            break;
+                        }
+                    }
+                }
+                etotal += nsevent;
+                if(verbose > 0) {
+                    fprintf(stderr, "\n");
+                    fprintf(stderr, "   %d correlated seismic events found for gather (%s=%d)\n      with median time: ", nsevent, key, keyno);
+                    for(i = 0; i < nsevent; ++i) fprintf(stderr, "%5.3f ", itevent[i]*dt);
+                    fprintf(stderr, "\n");
+                }
+            }
+
+            // calc input trace starting time
+            double tday = dday(hdrs[0][0].day, hdrs[0][0].hour, hdrs[0][0].minute, hdrs[0][0].sec, hdrs[0][0].timbas + 0.001*hdrs[0][0].trwf);
+            if (level == 1 && drop == 1 && hasEvent == 0) {
+                if(verbose) warn("Dropped %d-th gather (%s=%d) with fldr=%d",
+                                 ngather, key, keyno, hdrs[0][0].fldr);
+                continue;
+            } else {
+                int ncout = (eeout > 0)? ncmp + 1 : ncmp;
+                for (i = 0; i < nrcv; ++i) {
+                    for (j = 0; j < ncout; ++j) {
+                        void* pdata = indata[i][j];
+                        if (j == ncmp) { // ee component
+                            pdata = (level > 2)? winee[i] : eedata[i];
+                        }
+                        if (j < ncmp) memcpy(&outtr, &hdrs[i][j], HDRBYTES);
+                        memcpy(outtr.data, pdata, FSIZE * ns);
+                        outtr.duse = j + 1;
+                        if (level == 1) {
+                            if ( drop > 1 && nv[i] < 1) {
+                                if(verbose > 1) warn("Dropped %d-th receiver of %d-th gather (%s=%d) with fldr=%d",
+                                                 i+1, ngather, key, keyno, hdrs[0][0].fldr);
+                                continue;
+                            }
+                            if (hasEvent == 0 || nv[i] == 0) outtr.corr = 0;
+                            outtr.gaps = nv[i];
+                            puttr(&outtr);
+                        } else if (level == 2) {
+                            for (k = 0; k < nsevent; ++k) {
+                                int it = itevent[k] - nwe*3/5;  // put the event at 3/5 of time window
+                                int itstart = it;   // starting sample of input trace to be copied from
+                                int ittr = 0;       // starting sample of output trace to be copied to
+                                int nse = nwe;      // n of samples of output event trace
+                                if (it < 0) {
+                                    itstart = 0;
+                                    ittr = -it;
+                                    nse = nwe + it;
+                                }
+                                double tte = 0.0;    // event time in 1/10 ms
+                                int iv = 0;
+                                for (iv = 0; iv < nvn[k]; ++iv) {
+                                    if (i == ircv[ii[iii[k][iv]]]) {
+                                        tte = 10000.0 * dt * (ite[i][jevt[ii[iii[k][iv]]]] - itstart);
+                                    }
+                                }
+                                pdata = (j == ncmp)?  &eedata[i][itstart] : &indata[i][j][itstart];
+                                memset(outtr.data, 0, nwe*FSIZE);
+                                memcpy(&outtr.data[ittr], pdata, nse * FSIZE);
+                                outtr.ep = 10 * keyno + k + 1;
+                                setval(ctype, &val, (double) (k + 1));  // no. of isolated event
+                                puthval(&outtr, cindex, &val);
+                                setval(ttype, &val, tte);  // event time in 1/10 ms
+                                puthval(&outtr, tindex, &val);
+                                outtr.ns = nwe;
+                                // reset starting time
+                                outtr.sdel = timestamp(tday, it*dt, &outtr.day, &outtr.hour, &outtr.minute,
+                                              &outtr.sec, &outtr.timbas, &outtr.trwf);
+                                puttr(&outtr);
+                            }
+                        } else {  // level = 3 or 4
+                            outtr.sut = NINT(tevtm);
+                            double tte = 10000.0 * dt * itmaxee[i];
+                            setval(ttype, &val, tte);  // time of max energy
+                            puthval(&outtr, tindex, &val);
+                            puttr(&outtr);
+                        }
+                    }
+                }
+            }
+            val = valnew;
+            // reset output data
+            memset(itevent, 0, nemax * sizeof (int));
+            memset(*ite, 0, nmax * nemax * sizeof (int));
+            memset(nv, 0, nmax * sizeof (int));
+            memset(*hdrs, 0, nmax * ncmp * HDRBYTES);
+            memset(**indata, 0, nmax * ncmp * ns * FSIZE);
+            memset( *eedata, 0, nmax * ns * FSIZE);
+            memset( *winee, 0, nmax * ns * FSIZE);
+            memset( *w2rms, 0, nmax * nemax * FSIZE);
+            ntr = 0;
+            continue;
+        }
+        nsegy = gettr(&tr);
+    } while (!eof);
+
+    if (verbose) {
+        if (level == 1) warn("  %d events detected for total %d gathers of %d receivers", etotal, ngather, nrcv);
+        else if (level == 2) warn("  %d correlated seismic events found for total %d gathers", etotal, ngather);
+        else warn("Totally %d traces of %d gathers processed", total, ngather);
+    }
+
+    return (CWP_Exit());
+}
+
+float calcEE(const int nc, const int nrcv, const int ns, const float*** indata, float** eedata)
+{
+    int i, it;
+    float sqr, rms = 0.0;
+
+    if (nc < 5) {
+        for(i=0; i<nrcv; ++i) {
+            for (it=0; it<ns; ++it) {
+                sqr = indata[i][0][it]*indata[i][0][it] +
+                    indata[i][1][it]*indata[i][1][it] + indata[i][2][it]*indata[i][2][it];
+                rms += sqr;
+                eedata[i][it] = sqrtf(sqr);
+            }
+        }
+    } else {
+        for(i=0; i<nrcv; ++i) {
+            for (it=0; it<ns; ++it) {
+                sqr = indata[i][nc-2][it]*indata[i][nc-2][it] + indata[i][nc-1][it]*indata[i][nc-1][it];
+                rms += sqr;
+                eedata[i][it] = sqrtf(sqr);
+            }
+        }
+    }
+    return sqrtf(rms/(nrcv*ns));
+}
+
+float calcWinEE(const int nrcv, const int nc, const int nw1, const int nw2, const int nw3, const int it1, const int it2,
+        const float power, const float power3, const float** indata, float** eedata, int* itmax)
+{
+    int i, it;
+    float sqr1, sqr2, sqr3;
+    float maxrms;
+
+    for(i=0; i<nrcv; ++i) {
+        maxrms = sqr3 = sqr2 = sqr1 = 0.0;
+        for (it=it1; it<=it2; ++it) {
+            sqr1 = calcRms(it - nw1, nw1, indata[i]);
+            sqr2 = calcRms(it, nw2, indata[i]);
+            sqr3 = calcRms(it, nw3, indata[i]);
+            eedata[i][it] = powf(sqr3/nw3, power3)*powf(sqr2/nw2/(sqr1/nw1), power);
+            if (eedata[i][it] > maxrms) {
+                maxrms = eedata[i][it];
+                itmax[i] = it;
+            }
+        }
+    }
+    return 0;
+}
+
+int detectEvents(const int nrcv, const int ns, const float** eedata, const int nw1,
+    const int nw2, const int nw3, const float threshold, int* nv, int** ite, float** w2rms)
+{
+    int i, j, it, ntotal = 0;
+    float rms1, rms2, rms3, rmstr, r, r0 = 0.0;
+
+    for(i=0; i<nrcv; ++i) {
+        j = 0;
+        rmstr = calcRms(0, ns, eedata[i]);
+        for (it=nw1; it<ns-nw2; ++it) {
+            rms1 = calcRms(it - nw1, nw1, eedata[i]);
+            rms2 = calcRms(it, nw2, eedata[i]);
+            rms3 = calcRms(it, nw3, eedata[i]);
+            r = (rms2 / rms1) * (rms3 / rmstr);
+            if (r > threshold) {
+                if (r >= r0) {  // if rms bigger than previous, go one sample further, otherwise regard as onset sample
+                    r0 = r;
+                    continue;
+                }
+                ++nv[i];
+                ite[i][j] = it;
+                w2rms[i][j] = rms2;
+                ++j;
+                it += nw1 + nw2;  // skip to next window
+                r0 = 0.0;
+            }
+        }
+        ntotal += nv[i];
+    }
+
+    return ntotal;
+}
+
+float calcRms(const int itbeg, const int nt, const float* data)
+{
+    float sum = 0.0;
+    int nc, it;
+    for (it = 0, nc = 0; it < nt; ++it ) {
+        if (data[itbeg + it] != 0.0 ) {
+            ++nc;
+            sum += (data[itbeg + it])*(data[itbeg + it]);
+        }
+    }
+    return (nc > 0)? sqrtf(sum/nc) : 0.0;
+}
+

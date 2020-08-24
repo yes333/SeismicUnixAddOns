@@ -1,0 +1,453 @@
+/* Copyright (c) Colorado School of Mines, 2007.*/
+/* All rights reserved.                       */
+
+/* SPWFS */
+
+
+#include <cwp.h>
+#include <su.h>
+#include <header.h>
+#include <segy.h>
+#include <segyhdr.h>
+
+/*********************** self documentation ******************************/
+char *sdoc[] = {
+"									",
+" SPWFS - Wave Field Seperation in Tau-P domain for OBC seismic data	",
+"									",
+"    spwfs <stdin >stdout [options]					",
+"									",
+" Required Parameters:							",
+"    none								",
+"									",
+" Optional Parameters:							",
+"    nc=3           =4 four component wave field separation (P Z X Y)   ",
+"                   =3 three component (P Z X)                          ",
+"                   =2 two component (P Z)                              ",
+"                                                                	",
+"    modes=1,...    codes designate output wave mode             	",
+"                   1 = P total velocity field upgoing          	",
+"                   2 = P total velocity field downgoing           	",
+"                   3 = S total velocity field upgoing           	",
+"                   4 = S total velocity field downgoing           	",
+"                   5 = P potential field upgoing                       ",
+"                   6 = P potential field downgoing                     ",
+"                   7 = S potential field upgoing                       ",
+"                   8 = S potential field downgoing                     ",
+"                   9 = P vertical velocity field upgoing           	",
+"                  10 = P vertical velocity field downgoing           	",
+"                  11 = S horizontal velocity field upgoing           	",
+"                  12 = S horizontal velocity field downgoing          	",
+"                  13 = S Vertical velocity field upgoing          	",
+"                  14 = S Vertical stress field upgoing          	",
+"                                                                	",
+"    key=cdpt       keyword used to match input reflection coefficient 	",
+"                                                                	",
+"    vp=1.6         P-velocity of seafloor [km/s]			",
+"    vs=0.2         S-velocity of seafloor [km/s]			",
+"    db=1.6         density of seafloor [g/cm**2]                       ",
+"    vw=1.48        P-velocity in sea water [km/s]                      ",
+"    dw=1.03        density of sea water [g/cm**2]                      ",
+"                   the values above give a default Rpp = 0.255        	",
+"                                                                	",
+"    matched=1      geophone data is matched                          	",
+"                   =0 not matched, but calibrated                      ",
+"                     (geophone to be backscaled by impedance)	        ",
+"                                                                	",
+"    nrcv=240       max. number of receivers                            ",
+"    rcfile=        file containing reflection coefficients         	",
+"                                                                	",
+"    verbose=0      =n output info for every n-th trace                 ",
+"                                                                	",
+" Note:                                                                 ",
+"  Input tau-p data must be sorted trace by trace in order P, Z, X, Y.  ",
+"    Their polarities should be as recorded, e.g. >><< for shots recorded",
+"    in first quadrant (X --> E, Y --> N, Z --> Down).                  ",
+"  Output data are sorted trace by trace in the order as specified by   ",
+"    the modes. keyword duse code is set to be mode number              ",
+"    duse=mode                                                          ",
+"                                                                	",
+" Version 1.2.0  last modified Nov. 2010 by Sanyu Ye                    ",
+"                                                                	",
+NULL};
+
+/* Credits:
+ *	Sanyu Ye: READ Well Service, Feb. 2008
+ */
+/**************** end self doc *******************************************/
+
+/* define output wave mode */
+#define MODE_P_TOTOL_UPGOING            1
+#define MODE_P_TOTOL_DOWNGOING          2
+#define MODE_S_TOTOL_UPGOING            3
+#define MODE_S_TOTOL_DOWNGOING          4
+#define MODE_P_POTENTIAL_UPGOING        5
+#define MODE_P_POTENTIAL_DOWNGOING      6
+#define MODE_S_POTENTIAL_UPGOING        7
+#define MODE_S_POTENTIAL_DOWNGOING      8
+#define MODE_P_V_Z_UPGOING              9
+#define MODE_P_V_Z_DOWNGOING           10
+#define MODE_S_V_H_UPGOING             11
+#define MODE_S_V_H_DOWNGOING           12
+#define MODE_S_V_V_UPGOING             13
+#define MODE_S_S_V_UPGOING             14
+#define MODE_P_UPGOING_2C              15
+#define MODE_P_UPGOING_4C              16
+ 
+/* prototypes */
+float InferV(float Vw, float Dw, float Vp0, float D0, float Vs0, float Rpp, float* Vp, float* Vs);
+int Decompose(int nt, int matched, float Vp, float Vs, float Imp, float px, float py,
+                     int nc, float** trdata, int nm, int* modes, float** trout);
+
+#define  MaxModes 16
+float A[MaxModes], B[MaxModes], C[MaxModes], D[MaxModes]; // coeff for X Y Z H of all modes
+
+int main(int argc, char **argv) {
+    cwp_String key;		/* header key word from segy.h		*/
+    cwp_String type;            /* type of key				*/
+    Value val;                  /* value of key			*/
+    double dval, dvallast;      /* double value of key			*/
+    int index;                  /* index of key				*/
+    int nt;                     /* numsamps as int			*/
+    int nc;                     /* number of components			*/
+    int nsegy;                  /* length bytes read for segy trace	*/
+    int nm, modes[12];          /* number of output wave modes and its values */
+    segyhdr *hdrs1d = NULL;     /* buffer array of input trace headers  */
+    float *trbuf=NULL;          /* trace buffer	containing trace data, padded with zero to ntfft  */
+    float **trdata=NULL;	/* tau-p-domain for all input components   */
+    float **trout=NULL;         /* tau-p-domain traces of all output components   */
+    float Vw, dw;               /* water velocity and density           */
+    float Vp0, Vs0, d0;         /* default P-, S-velocity and density of sea bottom */
+    float Vp, Vs, Rpp, Imp;     /* P-, S-velocity, RC and impedance at receiver site */
+    float px, py    ;           /* input trace px py header values */
+
+    int verbose;		/* =0 no info, >0 output info  */
+    int matched=1;              /* is geophone data mached?	*/
+    int i, ntr;                 /* loop and trace counter */
+    int nrcv, nRow;             /* max. and actual rc values read in */
+    double *mkeys = NULL;           /* pointer containing values of matching keys */
+    double *vkeys = NULL;           /* pointer containing values of keys to be set */
+
+    char *rcfile="";                /* name of input file of reflection coefficients	*/
+    FILE *rcfp=NULL;                /* pointer to input file		*/
+    cwp_Bool from_file=cwp_false;   /* is the data from infile?	*/
+    cwp_Bool RppFound=cwp_false;    /* is reflectivity value found for that receiver?	*/
+    
+    segy tr;
+    
+    /* Initialize */
+    initargs(argc, argv);
+    requestdoc(1);
+
+    /* get match key */
+    if (!getparstring("key", &key))	 key="cdpt";
+    type = hdtype(key);
+    index = getindex(key);
+
+    if (!getparint("nc", &nc)) nc=3;
+ 
+    /* get output wave modes */
+    if ((nm=countparval("modes")) > 0) {
+        getparint("modes", modes);         
+        for (i=0; i<nm; ++i) {
+             if (modes[i] > MaxModes || modes[i] < 1) err("invalid wave mode modes[%d]=%d", i, modes[i]);
+        }
+    } else { /* set default */
+        nm = 1;
+        modes[0] = 1;
+    }
+    
+    if (!getparint("verbose", &verbose)) verbose=0;
+    if (!getparint("matched", &matched)) matched=1;
+
+    if (!getparfloat("vw", &Vw)) Vw=1.48;
+    if (!getparfloat("dw", &dw)) dw=1.03;
+    if (!getparfloat("vp", &Vp0)) Vp0=1.60;
+    if (!getparfloat("vs", &Vs0)) Vs0=0.20;
+    if (!getparfloat("db", &d0)) d0=1.60;
+
+    /* get name of infile for reflection coefficients*/
+    getparstring("rcfile",&rcfile);
+
+    /* if infile is specified get specified keys from file */
+    if (*rcfile!='\0') {
+            /* open infile */
+            if((rcfp=efopen(rcfile,"r"))==NULL) err("cannot open rcfile=%s\n",rcfile);
+            from_file=cwp_true; /* set from_file flag */
+    }
+   
+    
+    /* Evaluate time bounds from getpars and first header */
+    if ( (nsegy=gettr(&tr)) == 0) err("can't get first trace");
+
+    nt = tr.ns;
+
+    hdrs1d = (segyhdr *) ealloc1(nc, HDRBYTES);
+    trdata = ealloc2float(nt, nc);
+    trout = ealloc2float(nt, nm);
+
+    /* read rc values from file */
+    if (from_file) { 
+        if (!getparint("nrcv", &nrcv)) nrcv=240;
+        mkeys = ealloc1double(nrcv);
+        vkeys = ealloc1double(nrcv);
+
+        /* reading all data from ascii infile */
+        /*  fscanf returns: 0   : characters there, but no conversion (error)
+        *		  EOF : eof before conversion
+        *		  else: number of conversions 
+        */
+        for (nRow=0; nRow < nrcv; ++nRow) {
+            int ret = fscanf(rcfp, "%lf", &mkeys[nRow]);
+            if(ret == EOF || ret == 0) break;  /* else everything is okay: get out of the loop */
+            ret = fscanf(rcfp, "%lf", &vkeys[nRow] );
+            if(ret == EOF || ret == 0) break;  /* else everything is okay: get out of the loop */
+        }
+        
+        if (verbose) warn(" %d values are read in from rcfile=%s", nRow, rcfile);
+    }
+    
+    //decomposing wavefield
+    ntr = 0;
+    /* Main loop over traces */
+    while (nsegy > HDRBYTES ) {
+        i = ntr % nc;
+        memcpy(&hdrs1d[i], &tr, HDRBYTES);  //cache header
+        memcpy(trdata[i], tr.data, nt*FSIZE); // cache data
+
+        if ( ++ntr%nc == 0 ) { // nc traces read in, start separation
+            if (from_file) { // retrieve rc
+                gethval(&tr, index, &val);
+                dval = vtod(type, val);
+                if (dvallast != dval) {
+                    RppFound = cwp_false;
+                    for (i=0; i<nRow; ++i) { //loop over to find right rc 
+                        if ( dval == mkeys[i] ) { 
+                            Rpp = vkeys[i];
+                            RppFound = cwp_true;
+                            break;
+                        }
+                    }
+                    if (RppFound) { 
+                        Imp = InferV(Vw, dw, Vp0, d0, Vs0, Rpp, &Vp, &Vs);
+                    } else { //assume default values
+                        Vp = Vp0;
+                        Vs = Vs0;
+                        Imp = d0*Vp;
+                    }
+                }
+            } else { //assume default values
+                Vp = Vp0;
+                Vs = Vs0;
+                Imp = d0*Vp;
+            }
+            
+            px = tr.fx;
+            py = tr.fy;
+            
+            Decompose(nt, matched, Vp, Vs, Imp, px, py, nc, trdata, nm, modes, trout); 
+            
+            
+            // back to t and output
+            for (i=0; i<nm; ++i) {
+                memcpy(&tr, &hdrs1d[(i<nc)? i : nc-1], HDRBYTES);
+                tr.duse = modes[i];  // mark component with mode
+                memcpy(tr.data, trout[i], nt*FSIZE);
+                puttr(&tr);
+            }
+            if (verbose && (ntr/nc - 1)%(1000/verbose) == 0) { //output info
+                gethval(&tr, index, &val);
+                warn(" %d-th trace: %s=%d  px=%.6f py=%.6f of %d compomnents are processed", 
+                        ntr/nc, key, vtoi(type, val), px, py, nc);
+                // print out coefficients for inspection
+                for (i=0; i<nm; ++i) {
+                    fprintf(stderr, "        Mode=%2d  P=%8.6f Z=%8.6f X=%8.6f Y=%8.6f \n",
+                        modes[i], D[modes[i]-1], C[modes[i]-1], A[modes[i]-1], B[modes[i]-1]);
+                }
+            }
+        }
+
+        //read next trace
+        nsegy = gettr(&tr);
+    }
+
+    if (verbose) warn(" Totally %d traces for each of %d compomnents are processed", ntr/nc, nc);
+    
+    if (hdrs1d) free(hdrs1d);
+    if (trbuf) free1float(trbuf);
+    if (trdata) free2float(trdata);
+    if (trout) free2float(trout);
+    
+    return(CWP_Exit());
+}
+    
+float InferV(float Vw, float Dw, float Vp0, float D0, float Vs0, float Rpp, float* Vp, float* Vs)
+{
+    // assuming percentage change of density is n1 times than that (a) of Vp , change (b) of Vs is n2 times than Vp
+    // upon percentage change c in reflection coefficient, there is formula
+    // a = 2 * c * R0/ ( ( 1 + R0) * ( 1 - R0 ) * ( 1 + n1 ) )  ~= 2cR0/(1+n1);    b = n2 * a;
+    
+    float n1 = 3.0, n2 = 5.0; // assumption
+    float a, b, c, R0;
+    
+    R0 = (Vp0 * D0 - Vw * Dw) / (Vp0 * D0 + Vw * Dw);
+    c = Rpp / R0 - 1.0;
+    a = 2 * c * R0 / ( ( 1 + R0) * ( 1 - R0 ) * ( 1 + n1 ) );
+    b = n2 * a;
+    *Vp = (1.0 + a) * Vp0;
+    *Vs = (1.0 + b) * Vs0;
+    return Dw*Vw*(1.0 + Rpp)/(1.0 - Rpp);  // impedance of seafloor
+}
+
+int Decompose(int nt, int matched, float Vp, float Vs, float Imp, float px, float py,
+                     int nc, float** trdata, int nm, int* modes, float** trout)
+{
+    int i, m;  // loop counter
+    float a, b, c, d, F;
+    float p, VpQp, divVpQp, VsQs, divVsQs;
+    float *H, *Z, *X, *Y;  // matched or calibrated data components
+    float COStheta2;
+    double minCOStheta2 = 0.04; // about 78 degrees
+    cwp_Bool overcritical = cwp_false;
+
+    memset(A, 0, MaxModes*FSIZE);
+    memset(B, 0, MaxModes*FSIZE);
+    memset(C, 0, MaxModes*FSIZE);
+    memset(D, 0, MaxModes*FSIZE);
+    
+    H = trdata[0];
+    Z = trdata[1];
+    X = trdata[2];
+    Y = trdata[3];
+    
+    p = sqrt(px*px + py*py);
+    
+    //Cap the minimum of V*Q = cos(theta) thus division not go to unlimited
+    COStheta2 = 1.0 - p*p*Vp*Vp;
+    if (COStheta2 < -minCOStheta2  ) {
+        VpQp = sqrt(-COStheta2);
+        divVpQp = 1.0/VpQp;
+        overcritical = cwp_true;
+    } else if(COStheta2 < 0.0) {
+        VpQp = sqrt(-COStheta2);
+        divVpQp = 1.0/sqrt(minCOStheta2);
+        overcritical = cwp_true;
+    } else if (COStheta2 <= minCOStheta2) {
+        VpQp = sqrt(COStheta2);        
+        divVpQp = 1.0/sqrt(minCOStheta2);        
+    } else {
+        VpQp = sqrt(COStheta2);
+        divVpQp = 1.0/VpQp;
+    }
+    COStheta2 = 1.0 - p*p*Vs*Vs;
+    if (COStheta2 < minCOStheta2  ) {
+        VsQs = -sqrt(-COStheta2);
+        divVsQs = 1.0/VsQs;
+    } else if(COStheta2 < 0.0) {
+        VsQs = -sqrt(-COStheta2);
+        divVsQs = 1.0/sqrt(minCOStheta2);
+    } else if (COStheta2 <= minCOStheta2) {
+        VsQs = sqrt(COStheta2);        
+        divVsQs = 1.0/sqrt(minCOStheta2);        
+    } else {
+        VsQs = sqrt(COStheta2);
+        divVsQs = 1.0/VsQs;
+    }
+             
+    a = 1.0 - 2.0*p*p*Vp*Vp;
+    b = 1.0 - 2.0*p*p*Vs*Vs;
+    
+    c = (!p)?  0.0: px/p; 
+    d = (!p)?  0.0: py/p; 
+    
+    F = 4.0*p*p*Vs*Vs*Vs*VsQs*VpQp/Vp + b*b;
+    
+    A[0] = -px*a*Vs*Vs/Vp/Imp;
+    B[0] = -py*a*Vs*Vs/Vp/Imp;
+    C[0] = 0.5*a*b*divVpQp/Imp;
+    D[0] = -0.5*a/Imp;
+    A[1] = px*Vs*Vs/Vp/Imp;
+    B[1] = py*Vs*Vs/Vp/Imp;
+    C[1] = 0.5*b*divVpQp/Imp;
+    D[1] = 0.5/Imp;
+    A[2] = -0.5*c*b*b*Vp*divVpQp/Vs/Imp;
+    B[2] = -0.5*d*b*b*Vp*divVpQp/Vs/Imp;
+    C[2] = -0.5*p*Vs*b/Imp;
+    D[2] = 0.5*p*Vp*b*divVsQs/Imp;
+    A[3] = -0.5*c*b*Vp*divVpQp/Vs/Imp;
+    B[3] = -0.5*d*b*Vp*divVpQp/Vs/Imp;
+    C[3] = 0.5*p*Vs/Imp;
+    D[3] = 0.5*p*Vp*divVsQs/Imp;
+    A[4] = px*Vs*Vs*Vs*VpQp*divVsQs/Vp/Vp;
+    B[4] = py*Vs*Vs*Vs*VpQp*divVsQs/Vp/Vp;
+    C[4] = 0.5*b*divVpQp;
+    D[4] = (2.0*p*p*Vs*Vs*Vs*Vs*VpQp*VpQp/Vp/Vp - 0.5*b*(p*p*Vs*Vs*VpQp/Vp + VsQs/Vs)*Vs*divVsQs)/F;
+    A[5] = A[4];
+    B[5] = B[4];
+    C[5] = -C[4];
+    D[5] = D[4];  
+    A[6] = -c*b*Vs*divVsQs/Vp;
+    B[6] = -d*b*Vs*divVsQs/Vp;
+    C[6] = p*Vs*Vs/Vp;
+    D[6] = -p*(2.0*b*Vs*Vs*VpQp/Vp - 0.5*b*b*Vs*divVsQs)/F;
+    A[7] = -A[6];
+    B[7] = -B[6];
+    C[7] = C[6];
+    D[7] = -D[6];
+    A[8] = -px*Vs*Vs*VpQp/Vp/Imp;
+    B[8] = -py*Vs*Vs*VpQp/Vp/Imp;
+    C[8] = 0.5*b/Imp;
+    D[8] = -0.5*VpQp/Imp;
+    A[9] = -A[8];
+    B[9] = -B[8];
+    C[9] = C[8];
+    D[9] = -D[8];
+    A[10] = 0.5*c*b/Imp;
+    B[10] = 0.5*d*b/Imp;
+    C[10] = p*Vs*VsQs/Imp;
+    D[10] = -0.5*p*Vp/Imp;
+    A[11] = A[10];
+    B[11] = B[10];
+    C[11] = -C[10];
+    D[11] = D[10];
+    A[12] = 0.5*b*px*Vs/Vp;
+    B[12] = 0.5*b*py*Vs/Vp;
+    C[12] = p*p*Vs*Vs/Vp;
+    //if( overcritical ) C[12] = -C[12];
+    D[12] = -0.5*p*p*Vs*divVsQs;
+    A[13] = b*px*Vs*Vs/Vp;
+    B[13] = b*py*Vs*Vs/Vp;
+    C[13] = 2.0*p*p*Vs*Vs*Vs*VsQs/Vp;
+    D[13] = -p*p*Vs*Vs;
+    A[14] = b*px*Vs*Vs/Vp;
+    B[14] = b*py*Vs*Vs/Vp;
+    C[14] = -0.5*(b*b + 4.0*p*p*Vs*Vs*Vs*VsQs*VpQp/Vp)*divVpQp;
+    //if( overcritical ) C[12] = -C[12];
+    D[14] = 0.5;
+    A[15] = b*px*Vs*Vs/Vp;
+    B[15] = b*py*Vs*Vs/Vp;
+    C[15] = -0.5*b*b*divVpQp;
+    D[15] = 0.5*b;
+    //A[13] = 0.5*px*Vs/VsQs*(1 - 2.0*Vs*Vs*(p*p + VpQp*VsQs/Vp/Vs));
+    //B[13] = 0.5*py*Vs/VsQs*(1 - 2.0*Vs*Vs*(p*p + VpQp*VsQs/Vp/Vs));
+    //C[13] = 0.5;
+    //D[13] = -0.5*Vp*Vs/VsQs*(p*p + VpQp*VsQs/Vp/Vs);
+    
+    if (!matched) {
+        for (i=0; i<MaxModes; ++i) {
+            A[i] *= Imp;
+            B[i] *= Imp;
+            C[i] *= Imp;
+        }
+    }
+    
+    for (m=0; m<nm; ++m) {        
+        for (i=0; i<nt; ++i) { // loop over samples
+                trout[m][i] = D[modes[m] - 1]*H[i] + C[modes[m] - 1]*Z[i];
+                if (nc > 2) trout[m][i] += -A[modes[m] - 1]*X[i];  // negative sign because our usual coordinate system
+                if (nc > 3) trout[m][i] += -B[modes[m] - 1]*Y[i];  // is left-handed (X -> E, Y -> N, Z -> Down)
+        }
+    }
+
+    return nm;
+}

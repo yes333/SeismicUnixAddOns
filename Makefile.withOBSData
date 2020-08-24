@@ -1,0 +1,77 @@
+# Makefile for ...su/main
+
+include $(CWPROOT)/src/Makefile.config
+
+
+D = $L/libcwp.a $L/libpar.a $L/libsu.a
+
+
+LFLAGS= $(PRELFLAGS) -L$L -lsu -lpar -lcwp -lfftw3f -lm $(POSTLFLAGS)
+
+
+PROGS =			\
+	$B/ftnstrip	\
+	$B/mirf2su	\
+	$B/sac2su	\
+	$B/sedis2sac	\
+	$B/obs2sac	\
+	$B/seg2su	\
+	$B/seg22su	\
+	$B/sp2crot	\
+	$B/sp3crot	\
+	$B/spdebias	\
+	$B/spevent	\
+	$B/spfk		\
+	$B/spfk2taup	\
+	$B/spftb	\
+	$B/spfxmedian	\
+	$B/spgsort	\
+	$B/splocevt	\
+	$B/spms3cmig	\
+	$B/spmovie	\
+	$B/spmedian	\
+	$B/spnmo	\
+	$B/spqest	\
+	$B/spqfilt	\
+	$B/spradon	\
+	$B/sprelobc	\
+	$B/spsort	\
+	$B/sptaper	\
+	$B/spsvd	\
+	$B/sptaup3d	\
+	$B/spxtscale	\
+	$B/spwavsep	\
+	$B/spwfs	\
+	$B/spwpef	\
+	$B/spwof	\
+	$B/segyread	\
+	$B/segywrite	\
+	$B/suazimuth	\
+	$B/suchw	\
+	$B/sugain	\
+	$B/suline2grid	\
+	$B/sumean	\
+	$B/sumerge	\
+	$B/sumute	\
+	$B/sureduce	\
+	$B/susetgather  \
+	$B/sushw	\
+	$B/sustack 
+
+
+INSTALL	:	$(PROGS)
+	@-rm -f INSTALL
+	@touch $@
+
+
+$(PROGS):	$(CTARGET) $D 
+	-$(CC) $(CFLAGS) $(@F).c $(LFLAGS) -o $@
+	@$(MCHMODLINE)
+	@echo $(@F) installed in $B
+
+remake	:
+	-rm -f $(PROGS) INSTALL
+	$(MAKE) 
+	
+clean::
+	rm -f a.out junk* JUNK* core
