@@ -4,3 +4,7 @@
 /Makefile~
 /compile.txt
 /segyread.c~
+
+*.m
+
+.gitignore

@@ -21,3 +21,9 @@ cp include/bheader.h $CWPROOT/src/su/include
 
 cp include/cwpcmaps.h $CWPROOT/src/psplot/include
 
+# replace make config file
+
+mv -b $CWPROOT/src/Makefile.config $CWPROOT/src/Makefile.config.bkp
+
+cp Makefile2020.config $CWPROOT/src/Makefile.config
+

@@ -27,8 +27,7 @@
 #define SEGY_H
 
 #define SU_NFLTS	USHRT_MAX	/* Arbitrary limit on data array size	*/
-/**#define SU_NFLTS	65535   /*   Arbitrary limit on data array size	*/
-/* #define SU_NFLTS	32767	 Arbitrary limit on data array size	*/
+/* #define SU_NFLTS	65535    Arbitrary limit on data array size	*/
 
 
 /* TYPEDEFS */
